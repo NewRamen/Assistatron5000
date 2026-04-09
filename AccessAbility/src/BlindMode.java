@@ -3,6 +3,7 @@ import java.awt.*;
 import java.awt.event.*;
 import java.awt.image.*;
 import java.io.*;
+import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import javax.imageio.*;
@@ -26,8 +27,7 @@ public class BlindMode extends JPanel {
 
     JLabel       statusLbl, bigObjectLbl, distanceLbl, directionLbl;
     JProgressBar proximityBar;
-    JLabel       proxDescLbl, susAlertLbl, rizzLbl, roastLbl, roastEmojiLbl;
-    JPanel       susAlertPanel;
+    JLabel       proxDescLbl;
     JTextArea    logArea;
     JButton      startBtn, stopBtn;
     JComboBox<String> envPicker;
@@ -49,11 +49,13 @@ public class BlindMode extends JPanel {
     BufferedWriter yoloStdin  = null;
     BufferedReader yoloStdout = null;
 
-    // live preview -- separate from YOLO scan, runs at 10+fps using ffmpeg or imagesnap loop
     Process              liveProcess = null;
     javax.swing.Timer    liveTimer   = null;
-    String               livePath    = System.getProperty("java.io.tmpdir") + File.separator + "aa_live.jpg";
-    boolean              ffmpegAvail = false;
+    String               livePath    = "/tmp/aa_live.jpg"; // shared with Python script
+    boolean              ffmpegAvail         = false;
+    volatile boolean     frameReaderRunning  = false;
+    volatile BufferedImage lastGoodFrame     = null;
+    volatile long        lastFrameModified   = 0;
 
     static final String[] INDOOR_OBJECTS  = {
         "chair","table","door","person","desk","laptop","couch","stairs",
@@ -71,55 +73,6 @@ public class BlindMode extends JPanel {
         "to your left","to your right","ahead and left","ahead and right"
     };
 
-    static final Map<String,String> OBJECT_ROASTS = new HashMap<String,String>() {{
-        put("chair",        "just a chair. very chair-like. 0 threats detected 🪑");
-        put("table",        "table detected. tables are just flat chairs fr");
-        put("door",         "door!!! the DOOR!! do NOT walk through the wall!!!");
-        put("person",       "theres literally a human being right there. make eye contact 👀");
-        put("desk",         "a desk. probably has someones homework on it. not yours.");
-        put("laptop",       "laptop detected — someone is procrastinating nearby");
-        put("couch",        "couch found. it is calling your name. resist.");
-        put("stairs",       "STAIRS!! stairs are the natural predator of ankles 🦶");
-        put("window",       "window. do NOT lick it. i mean it.");
-        put("lamp",         "lamp spotted. if it starts moving call the police.");
-        put("bookshelf",    "bookshelf. all those books and nobody reading them 💀");
-        put("counter",      "counter detected. probably has crumbs on it.");
-        put("refrigerator", "FRIDGE!! you dont need to eat right now. walk away.");
-        put("bed",          "BED!! your nemesis. your hero. your everything 🛏️");
-        put("cabinet",      "cabinet. something mysterious inside. do NOT open.");
-        put("car",          "THERE IS A CAR. THIS IS NOT A DRILL. FLEE 🚗💨");
-        put("bicycle",      "bike detected. nobody locks bikes properly these days fr");
-        put("tree",         "tree. it has been there longer than you. respect it 🌳");
-        put("building",     "building spotted. full of people who hate Mondays.");
-        put("crosswalk",    "crosswalk!!! wait for the light!!!! please!!!! 🚦");
-        put("stop sign",    "STOP SIGN. this means YOU.");
-        put("bench",        "bench. just sits there. doing nothing. we respect it.");
-        put("fire hydrant", "fire hydrant. bro please dont trip over this one.");
-        put("bus",          "BUS DETECTED!! catch it or FLEE, pick one 🚌");
-        put("motorcycle",   "motorcycle. loud, fast, somehow always behind you 🏍️");
-        put("traffic light","traffic light. the one thing that controls all of us.");
-        put("pole",         "pole alert. this is how people get funny videos 😭");
-        put("curb",         "curb. the final boss of walking. you WILL stub your toe.");
-        put("backpack",     "backpack spotted. someone is carrying too many textbooks 📚");
-        put("cell phone",   "phone detected. they r definitely on tiktok.");
-        put("bottle",       "water bottle. hydration check!! drink some water omg.");
-        put("cup",          "cup detected. coffee or tea? either way we respect the grind.");
-        put("keyboard",     "keyboard. somewhere a programmer is crying.");
-        put("mouse",        "computer mouse. not the animal. unfortunately.");
-        put("tv",           "TV detected. you should be doing homework rn.");
-        put("clock",        "clock. time is passing. make it count (or dont idc).");
-        put("book",         "book! an actual book!! in this economy!!!");
-    }};
-
-    static final String[] RIZZ_LEVELS = {
-        "rizz level: critically low 😭 evacuate",
-        "rizz level: in the negative numbers somehow",
-        "rizz level: mid at best, godspeed 🙏",
-        "rizz level: decent actually, dont blow it",
-        "rizz level: kinda built different fr fr",
-        "rizz level: W rizz detected 🏆",
-        "rizz level: UNMATCHED. call the authorities."
-    };
 
     static final Color C_BG      = new Color(13,13,23),   C_CARD    = new Color(22,22,38);
     static final Color C_CARD2   = new Color(26,26,44),   C_BORDER  = new Color(45,45,68);
@@ -158,26 +111,63 @@ public class BlindMode extends JPanel {
         return false;
     }
 
-    // persistent server script — loads model ONCE then reads image paths from stdin
-    // way faster than spawning a new process every scan (no model reload = ~50ms per frame)
+    // combined script: opens the camera with OpenCV, writes live frames to disk at ~20fps,
+    // AND runs YOLO on the latest in-memory frame whenever Java sends "detect\n".
+    // replaces the old ffmpeg-for-preview + file-path YOLO approach that was unreliable.
     void writeDetectScript() {
         String script =
-            "import sys, os\n" +
+            "import sys, os, threading, time\n" +
             "try:\n" +
+            "    import cv2\n" +
             "    from ultralytics import YOLO\n" +
-            "    model = YOLO('yolov8n.pt')\n" +
-            "    sys.stdout.write('__READY__\\n'); sys.stdout.flush()\n" +
-            "except ImportError:\n" +
+            "except ImportError as e:\n" +
             "    sys.stdout.write('__NO_LIB__\\n'); sys.stdout.flush(); sys.exit(1)\n" +
+            "\n" +
+            "LIVE_PATH = '/tmp/aa_live.jpg'\n" +
+            "\n" +
+            "try:\n" +
+            "    model = YOLO('yolov8n.pt')\n" +
             "except Exception as e:\n" +
             "    sys.stdout.write('__ERR__:' + str(e) + '\\n'); sys.stdout.flush(); sys.exit(1)\n" +
+            "\n" +
+            "cap = cv2.VideoCapture(0)\n" +
+            "if not cap.isOpened():\n" +
+            "    sys.stdout.write('__NO_CAM__\\n'); sys.stdout.flush(); sys.exit(1)\n" +
+            "cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)\n" +
+            "cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)\n" +
+            "cap.set(cv2.CAP_PROP_FPS, 30)\n" +
+            "\n" +
+            "latest_frame = [None]\n" +
+            "frame_lock = threading.Lock()\n" +
+            "\n" +
+            "def capture_loop():\n" +
+            "    while True:\n" +
+            "        ret, frame = cap.read()\n" +
+            "        if ret:\n" +
+            "            with frame_lock:\n" +
+            "                latest_frame[0] = frame.copy()\n" +
+            "            try:\n" +
+            "                cv2.imwrite(LIVE_PATH, frame, [cv2.IMWRITE_JPEG_QUALITY, 80])\n" +
+            "            except Exception:\n" +
+            "                pass\n" +
+            "        time.sleep(0.05)\n" +
+            "\n" +
+            "t = threading.Thread(target=capture_loop, daemon=True)\n" +
+            "t.start()\n" +
+            "time.sleep(0.8)  # let camera warm up before signalling ready\n" +
+            "sys.stdout.write('__READY__\\n'); sys.stdout.flush()\n" +
+            "\n" +
             "for line in sys.stdin:\n" +
-            "    img = line.strip()\n" +
-            "    if not img: continue\n" +
-            "    if not os.path.exists(img):\n" +
+            "    cmd = line.strip()\n" +
+            "    if not cmd: continue\n" +
+            "    if cmd == '__QUIT__': break\n" +
+            "    # any non-quit line = run detection on latest frame\n" +
+            "    with frame_lock:\n" +
+            "        frame = latest_frame[0].copy() if latest_frame[0] is not None else None\n" +
+            "    if frame is None:\n" +
             "        sys.stdout.write('__NO_IMAGE__\\n__DONE__\\n'); sys.stdout.flush(); continue\n" +
             "    try:\n" +
-            "        results = model(img, verbose=False, conf=0.35)\n" +
+            "        results = model(frame, verbose=False, conf=0.35)\n" +
             "        found = 0\n" +
             "        for r in results:\n" +
             "            for box in r.boxes:\n" +
@@ -189,12 +179,14 @@ public class BlindMode extends JPanel {
             "        if found == 0: sys.stdout.write('__NONE__\\n')\n" +
             "        sys.stdout.write('__DONE__\\n'); sys.stdout.flush()\n" +
             "    except Exception as e:\n" +
-            "        sys.stdout.write('__ERR__:' + str(e) + '\\n__DONE__\\n'); sys.stdout.flush()\n";
+            "        sys.stdout.write('__ERR__:' + str(e) + '\\n__DONE__\\n'); sys.stdout.flush()\n" +
+            "\n" +
+            "cap.release()\n";
         try {
             String path = System.getProperty("java.io.tmpdir") + File.separator + "aa_detect.py";
             PrintWriter pw = new PrintWriter(new FileWriter(path));
             pw.print(script); pw.close();
-            System.out.println("[YOLO] wrote server script to " + path);
+            System.out.println("[YOLO] wrote combined capture+detect script to " + path);
         } catch (Exception e) {
             System.out.println("[YOLO] couldnt write script: " + e.getMessage());
         }
@@ -231,10 +223,10 @@ public class BlindMode extends JPanel {
     // send image path to persistent process, read back results until __DONE__
     // returns list of String[]{label,conf,x,y,w,h}
     // each scan is now ~50-200ms instead of 3+ seconds
-    ArrayList<String[]> runYOLO(String imgPath) {
+    ArrayList<String[]> runYOLO(String ignored) {
         if (!yoloAvail || yoloProc == null || yoloStdin == null || yoloStdout == null) return null;
         try {
-            yoloStdin.write(imgPath + "\n"); yoloStdin.flush();
+            yoloStdin.write("detect\n"); yoloStdin.flush(); // Python uses latest in-memory frame
             ArrayList<String[]> results = new ArrayList<>();
             String line;
             while ((line = yoloStdout.readLine()) != null) {
@@ -268,150 +260,60 @@ public class BlindMode extends JPanel {
         return 5.5 + randGlonk.nextDouble() * 5.0;
     }
 
-    // ── CAMERA TOOL STUFF ─────────────────────────────────────────────
-
-    // find imagesnap - java doesnt have homebrew in its PATH so we check manually
-    //ok so we do this so images can we processed
-    static String findImagesnap() {
-        for (String path : new String[]{"/opt/homebrew/bin/imagesnap","/usr/local/bin/imagesnap","imagesnap"}) {
-            File f = new File(path);
-            if (f.exists() && f.canExecute()) return path;
-        }
-        return null;
-    }
-
-    static String findFfmpegMac() {
-        for (String p : new String[]{"/opt/homebrew/bin/ffmpeg","/usr/local/bin/ffmpeg","ffmpeg"}) {
-            try {
-                File f = new File(p);
-                if ((!p.contains("/") || f.exists()) ) {
-                    Process proc = Runtime.getRuntime().exec(new String[]{p,"-version"});
-                    proc.waitFor(2,TimeUnit.SECONDS);
-                    if (proc.exitValue()==0) return p;
-                }
-            } catch (Exception e) {}
-        }
-        return null;
-    }
-
-    static String findFfmpegWindows() {
-        for (String g : new String[]{"ffmpeg","C:\\ffmpeg\\bin\\ffmpeg.exe","C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe"}) {
-            try {
-                Process p = Runtime.getRuntime().exec(new String[]{g,"-version"});
-                p.waitFor(2, TimeUnit.SECONDS);
-                if (p.exitValue()==0) return g;
-            } catch (Exception e) {}
-        }
-        return null;
-    }
-
     boolean checkCameraTool() {
-        String os = System.getProperty("os.name").toLowerCase();
-        try {
-            if (os.contains("mac")) {
-                String path = findImagesnap(); if (path==null) return false;
-                Runtime.getRuntime().exec(new String[]{path,"--help"}).waitFor(2,TimeUnit.SECONDS);
-                return true;
-            } else if (os.contains("win")) {
-                return findFfmpegWindows() != null;
-            } else {
-                Process p = Runtime.getRuntime().exec(new String[]{"ffmpeg","-version"});
-                p.waitFor(2,TimeUnit.SECONDS); return p.exitValue()==0;
-            }
-        } catch (Exception e) { return false; }
-    }
-
-    // start continuous live camera capture -- ffmpeg if available, imagesnap loop fallback
-    // this runs independently of YOLO scans so the preview is always smooth
-    void startLiveCapture() {
-        String os = System.getProperty("os.name").toLowerCase();
-        Thread t = new Thread(() -> {
+        for (String cmd : new String[]{"python3","python"}) {
             try {
-                if (os.contains("mac")) {
-                    String ff = findFfmpegMac();
-                    if (ff != null) {
-                        // ffmpeg avfoundation: keeps camera open and writes to same file at 10fps
-                        // -update 1 means keep overwriting the same output file (not making new ones)
-                        liveProcess = Runtime.getRuntime().exec(new String[]{
-                            ff,"-f","avfoundation","-framerate","15","-i","0",
-                            "-vf","fps=10","-update","1","-q:v","5","-y",livePath
-                        });
-                        ffmpegAvail = true;
-                        System.out.println("[Camera] ffmpeg live capture started (10fps)");
-                        // drain stderr so ffmpeg doesnt block on output buffer
-                        new Thread(() -> {
-                            try { liveProcess.getErrorStream().transferTo(OutputStream.nullOutputStream()); }
-                            catch (Exception e2) {}
-                        }, "FFmpegErr").start();
-                    } else {
-                        startImagensnapLoop(); // fallback: imagesnap subprocess loop
-                    }
-                } else if (os.contains("win")) {
-                    String ff = findFfmpegWindows();
-                    if (ff != null) {
-                        String dev = getWindowsDevice(ff);
-                        liveProcess = Runtime.getRuntime().exec(new String[]{
-                            ff,"-f","dshow","-i","video="+dev,"-vf","fps=10","-update","1","-q:v","5","-y",livePath
-                        });
-                        ffmpegAvail = true;
-                        new Thread(() -> {
-                            try { liveProcess.getErrorStream().transferTo(OutputStream.nullOutputStream()); }
-                            catch (Exception e2) {}
-                        }, "FFmpegErr").start();
-                    }
-                } else {
-                    liveProcess = Runtime.getRuntime().exec(new String[]{
-                        "ffmpeg","-f","v4l2","-i","/dev/video0","-vf","fps=10","-update","1","-q:v","5","-y",livePath
-                    });
-                    ffmpegAvail = true;
-                    new Thread(() -> {
-                        try { liveProcess.getErrorStream().transferTo(OutputStream.nullOutputStream()); }
-                        catch (Exception e2) {}
-                    }, "FFmpegErr").start();
-                }
-            } catch (Exception e) {
-                System.out.println("[Camera] live capture error: " + e.getMessage());
-                startImagensnapLoop();
-            }
-        });
-        t.setDaemon(true); t.setName("LiveCapStart"); t.start();
+                Process p = Runtime.getRuntime().exec(new String[]{cmd,"-c","import cv2"});
+                p.waitFor(5, TimeUnit.SECONDS);
+                if (p.exitValue() == 0) return true;
+            } catch (Exception e) {}
+        }
+        return false;
+    }
 
-        // swing timer reads the latest frame from disk every 100ms and repaints
-        liveTimer = new javax.swing.Timer(100, e -> {
+    // the Python script (writeDetectScript) now owns the camera via OpenCV and writes
+    // frames to livePath continuously. this method just starts the Java-side reader
+    // that picks those frames up and paints them into CameraView.
+    void startLiveCapture() {
+        frameReaderRunning = true;
+        Thread fr = new Thread(() -> {
             File f = new File(livePath);
-            if (f.exists() && f.length() > 500) { // 500 bytes min to avoid reading partial write
+            while (frameReaderRunning) {
                 try {
-                    BufferedImage img = ImageIO.read(f);
-                    if (img != null) { cameraView.setFrame(img); cameraView.repaint(); }
-                } catch (Exception ex) {}
+                    if (f.exists() && f.length() > 500) {
+                        long mod = f.lastModified();
+                        if (mod != lastFrameModified) {
+                            lastFrameModified = mod;
+                            byte[] bytes = Files.readAllBytes(f.toPath());
+                            BufferedImage img = ImageIO.read(new ByteArrayInputStream(bytes));
+                            if (img != null) {
+                                lastGoodFrame = img;
+                                final BufferedImage fi = img;
+                                SwingUtilities.invokeLater(() -> {
+                                    cameraView.setFrame(fi);
+                                    cameraView.repaint();
+                                });
+                            }
+                        }
+                    }
+                    Thread.sleep(50);
+                } catch (InterruptedException ie) { break; }
+                catch (Exception ex) {}
             }
-        });
-        liveTimer.start();
+        }, "FrameReader");
+        fr.setDaemon(true);
+        fr.start();
+        System.out.println("[Camera] frame reader started, watching " + livePath);
     }
 
-    // imagesnap loop fallback -- runs imagesnap in a background thread repeatedly
-    // not as fast as ffmpeg but at least refreshes the preview
-    void startImagensnapLoop() {
-        Thread t = new Thread(() -> {
-            String snap = findImagesnap(); if (snap==null) return;
-            // first capture with warmup
-            try { Runtime.getRuntime().exec(new String[]{snap,"-q",livePath}).waitFor(4,TimeUnit.SECONDS); }
-            catch (Exception e) {}
-            // subsequent captures skip warmup (camera is already warm)
-            while (belloScanning) {
-                try {
-                    Runtime.getRuntime().exec(new String[]{snap,"-w","0","-q",livePath}).waitFor(1,TimeUnit.SECONDS);
-                    Thread.sleep(50);
-                } catch (Exception e) { break; }
-            }
-        });
-        t.setDaemon(true); t.setName("SnapLoop"); t.start();
-    }
 
     void stopLiveCapture() {
+        frameReaderRunning = false;           // stop background frame-reader thread
         if (liveTimer  != null) { liveTimer.stop();  liveTimer  = null; }
         if (liveProcess!= null) { liveProcess.destroy(); liveProcess = null; }
         ffmpegAvail = false;
+        lastGoodFrame = null;
+        lastFrameModified = 0;
     }
 
     // ── UI BUILDING ───────────────────────────────────────────────────
@@ -492,27 +394,6 @@ public class BlindMode extends JPanel {
         proxDescLbl = lbl("Start scanning to detect objects", new Font("Arial",Font.ITALIC,11), C_SUBTEXT);
         p.add(proxDescLbl); vs(p,16);
 
-        addHdr(p,"Sus Alert 👁️👁️"); vs(p,6);
-        susAlertPanel = new JPanel(new BorderLayout());
-        susAlertPanel.setBackground(new Color(28,22,38));
-        susAlertPanel.setBorder(BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(new Color(168,118,255,50),1),
-            BorderFactory.createEmptyBorder(10,12,10,12)));
-        susAlertPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
-        susAlertPanel.setMaximumSize(new Dimension(99999,65));
-        susAlertLbl = new JLabel("No suspicious activity detected");
-        susAlertLbl.setFont(new Font("Arial",Font.BOLD,12)); susAlertLbl.setForeground(C_SUBTEXT);
-        rizzLbl = new JLabel(" "); rizzLbl.setFont(new Font("Arial",Font.ITALIC,11)); rizzLbl.setForeground(C_MUTED);
-        susAlertPanel.add(susAlertLbl,BorderLayout.CENTER); susAlertPanel.add(rizzLbl,BorderLayout.SOUTH);
-        p.add(susAlertPanel); vs(p,16);
-
-        addHdr(p,"Object Roast 🔥"); vs(p,6);
-        roastEmojiLbl = new JLabel("🤔"); roastEmojiLbl.setFont(new Font("Dialog",Font.PLAIN,28));
-        roastEmojiLbl.setAlignmentX(Component.LEFT_ALIGNMENT); p.add(roastEmojiLbl); vs(p,4);
-        roastLbl = new JLabel("<html><i>start scanning to get roasted</i></html>");
-        roastLbl.setFont(new Font("Arial",Font.PLAIN,12)); roastLbl.setForeground(C_SUBTEXT);
-        roastLbl.setAlignmentX(Component.LEFT_ALIGNMENT); roastLbl.setMaximumSize(new Dimension(260,60));
-        p.add(roastLbl); vs(p,10);
 
         scanCountLbl = new JLabel("Scans: 0");
         scanCountLbl.setFont(new Font("Arial",Font.BOLD,11)); scanCountLbl.setForeground(C_SUBTEXT);
@@ -595,7 +476,6 @@ public class BlindMode extends JPanel {
                 try { frame = ImageIO.read(lf); } catch (Exception e) {}
             }
             // if no live frame yet (live process still starting up), fall back to one-shot capture
-            if (frame == null && imagensnapAvail) frame = captureFrame();
 
             // step 2: run YOLO on latest frame
             ArrayList<String[]> yoloResults = (yoloAvail && lf.exists()) ? runYOLO(livePath) : null;
@@ -669,26 +549,6 @@ public class BlindMode extends JPanel {
         else if (prox>30) { proximityBar.setForeground(C_YELLOW); proximityBar.setString("Moderate: "+String.format("%.1f",dist)+"m"); proxDescLbl.setText("Moderate distance"); proxDescLbl.setForeground(C_YELLOW); }
         else              { proximityBar.setForeground(C_GREEN);  proximityBar.setString("Safe: "+String.format("%.1f",dist)+"m"); proxDescLbl.setText("Safe distance"); proxDescLbl.setForeground(C_GREEN); }
 
-        // sus alert
-        if (lastDetected.contains("person") && dist < 2.8) {
-            susAlertPanel.setBackground(new Color(45,22,55));
-            susAlertPanel.setBorder(BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(C_PURPLE,2),BorderFactory.createEmptyBorder(10,12,10,12)));
-            susAlertLbl.setText(dist<1.0?"👁️👁️ THEY ARE RIGHT THERE. MAKE A MOVE.":dist<1.8?"👁️ SUS ALERT — very close!!":"👁️ Person nearby — is this ok??");
-            susAlertLbl.setForeground(C_PURPLE);
-            int rp=randGlonk.nextInt(101);
-            rizzLbl.setText(RIZZ_LEVELS[Math.min(rp/15,RIZZ_LEVELS.length-1)]);
-            rizzLbl.setForeground(rp>60?C_GREEN:rp>30?C_YELLOW:C_SUBTEXT);
-        } else {
-            susAlertLbl.setText("No suspicious activity detected"); susAlertLbl.setForeground(C_SUBTEXT);
-            rizzLbl.setText(" "); susAlertPanel.setBackground(new Color(28,22,38));
-            susAlertPanel.setBorder(BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(new Color(168,118,255,50),1),BorderFactory.createEmptyBorder(10,12,10,12)));
-        }
-
-        // roast
-        roastLbl.setText("<html>" + OBJECT_ROASTS.getOrDefault(near, near+" detected. honestly no thoughts.") + "</html>");
-        roastLbl.setForeground(C_TEXT);
-        roastEmojiLbl.setText(DANGER_SET.contains(near)?"💀":near.equals("person")?"👁️":near.equals("bed")?"😴":near.equals("refrigerator")?"🍕":"🔍");
-
         // tts + alert log
         boolean isDanger = DANGER_SET.contains(near) && dist < 3.0;
         if (isDanger) {
@@ -719,47 +579,6 @@ public class BlindMode extends JPanel {
         }
     }
 
-    // ── CAMERA CAPTURE ────────────────────────────────────────────────
-
-    BufferedImage captureFrame() {
-        if (!imagensnapAvail) return null;
-        String tmpPath = System.getProperty("java.io.tmpdir") + File.separator + "aa_frame.jpg";
-        try {
-            String os = System.getProperty("os.name").toLowerCase();
-            String[] cmd;
-            if (os.contains("mac")) {
-                String snap=findImagesnap(); if (snap==null) return null;
-                cmd = new String[]{snap,"-q",tmpPath};
-            } else if (os.contains("win")) {
-                String ff=findFfmpegWindows(); if (ff==null) return null;
-                String dev=getWindowsDevice(ff);
-                cmd = new String[]{ff,"-y","-f","dshow","-i","video="+dev,"-frames:v","1","-q:v","2",tmpPath};
-            } else {
-                cmd = new String[]{"ffmpeg","-y","-f","v4l2","-i","/dev/video0","-frames:v","1",tmpPath};
-            }
-            Process p = Runtime.getRuntime().exec(cmd);
-            if (!p.waitFor(6,TimeUnit.SECONDS)) { p.destroy(); return null; }
-            File f = new File(tmpPath);
-            return f.exists()&&f.length()>0 ? ImageIO.read(f) : null;
-        } catch (Exception e) { System.out.println("[Camera] "+e.getMessage()); return null; }
-    }
-
-    static String getWindowsDevice(String ffPath) {
-        try {
-            Process p = Runtime.getRuntime().exec(new String[]{ffPath,"-list_devices","true","-f","dshow","-i","dummy"});
-            BufferedReader err = new BufferedReader(new InputStreamReader(p.getErrorStream()));
-            String line; boolean vid=false;
-            while ((line=err.readLine())!=null) {
-                if (line.contains("video")||line.contains("Video")) vid=true;
-                if (vid&&line.contains("\"")) {
-                    int a=line.indexOf('"'),b=line.lastIndexOf('"');
-                    if (a<b) return line.substring(a+1,b);
-                }
-            }
-            p.waitFor(3,TimeUnit.SECONDS);
-        } catch (Exception e) {}
-        return "Integrated Camera";
-    }
 
     void announceNow() {
         if (lastDetected.isEmpty()) { AudioStuff.speak("No objects detected. Start scanning first."); return; }

@@ -68,6 +68,7 @@ public class AudioStuff {
     // ─────────────────────────────────────────────────────────
     public static String  currentVoice = "Alex";
     public static boolean ttsOn        = true;
+    private static volatile boolean ttsBusy = false; // prevents TTS overlap / UI spam
 
     // ─────────────────────────────────────────────────────────
     // MICROPHONE METHODS
@@ -225,6 +226,10 @@ public class AudioStuff {
             return;
         }
         if (text == null || text.isEmpty()) return;
+        // drop announcement if one is already playing — prevents queued speech
+        // piling up and making the UI look like its going crazy
+        if (ttsBusy) return;
+        ttsBusy = true;
 
         // run on background thread so UI doesnt freeze
         Thread ttsThread = new Thread(new Runnable() {
@@ -246,15 +251,19 @@ public class AudioStuff {
                         String psCmd = "Add-Type -AssemblyName System.speech; "
                             + "(new-object System.Speech.Synthesis.SpeechSynthesizer)"
                             + ".Speak('" + text.replace("'", "") + "');";
-                        Runtime.getRuntime().exec(new String[]{"powershell", "-command", psCmd});
+                        Process p = Runtime.getRuntime().exec(new String[]{"powershell", "-command", psCmd});
+                        p.waitFor();
                     } else {
                         // linux - try espeak
-                        Runtime.getRuntime().exec(new String[]{"espeak", text});
+                        Process p = Runtime.getRuntime().exec(new String[]{"espeak", text});
+                        p.waitFor();
                     }
 
                 } catch (Exception glonk) {
                     // dont crash if tts fails, just print and move on
                     System.out.println("[TTS] failed to speak: " + glonk.getMessage());
+                } finally {
+                    ttsBusy = false; // always release the lock so next announcement can go through
                 }
             }
         });

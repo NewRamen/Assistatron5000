@@ -5,6 +5,9 @@ import java.util.Map;
 import java.util.ArrayList;
 import java.io.*;
 
+// simple callback so showLoginScreen can hand results back to main()
+interface LoginCallback { void onLogin(String name, String mode); }
+
 // Main.java
 // THIS IS THE MAIN CLASS
 // it extends JFrame so it is literally the window
@@ -16,26 +19,28 @@ import java.io.*;
 // Topic: Assistive Technology for Deaf and Blind Users
 //
 // Problem: Deaf and Blind people still struggle with daily tasks even
-// with all the technology we have. Most apps assume the user has no
+// with all the technology we have Most apps assume the user has no
 // disability which is kinda a big problem
 //
 // Product: A dual mode app that:
 //   Deaf Mode  → monitors audio levels, flashes visual alerts, uses TTS
-//   Blind Mode → detects nearby objects (simulated), speaks what it sees
+//   Blind Mode → detects nearby objects 
 //
-// CS3 DATA STRUCTURES (at least 3 required, we have 5):
-//   1. ArrayList<Alert>          → alert history  (AlertManager.java)
-//   2. Queue<Alert>              → FIFO processing (AlertManager.java)
-//   3. TreeMap<String,Integer>   → category frequency, sorted (AlertManager.java)
-//   4. Stack<String>             → undo history (AlertManager.java)
-//   5. HashMap<String,UserProfile> → user profiles (AlertManager.java)
+// TSA:
+//   1. ArrayList<Alert>          alert history  (AlertManager.java)
+//   2. Queue<Alert>              FIFO processing (AlertManager.java)
+//   3. TreeMap<String,Integer>   category frequency, sorted (AlertManager.java)
+//   4. Stack<String>            undo history (AlertManager.java)
+//   5. HashMap<String,UserProfile>user profiles (AlertManager.java)
 //
-// to compile: javac -d out src/*.java
-// to run:     java -cp out Main
 //
 // hardware needed: java 8+, microphone optional, mac/windows/linux
 
 public class Main extends JFrame {
+
+    // ── login info set before the window is built ────────────────────
+    String loginName;   // entered on the login screen
+    String loginMode;   // "DEAF" or "BLIND" — chosen on login screen
 
     // ── shared stuff (all panels use these) ──────────────────────────
     AlertManager       alerts;
@@ -67,13 +72,19 @@ public class Main extends JFrame {
     static final Color C_SUBTEXT = new Color(115, 115, 140);
 
     // constructor - sets up EVERYTHING
-    public Main() {
-        System.out.println("Assistatron 5000 starting...");
+    public Main(String userName, String mode) {
+        loginName = (userName == null || userName.isEmpty()) ? "Guest" : userName;
+        loginMode = (mode     == null || mode.isEmpty())     ? "DEAF"  : mode;
+        System.out.println("Assistatron 5000 starting for user: " + loginName);
         System.out.println("TSA Software Development 2026");
 
         // step 1: make the data managers
         alerts   = new AlertManager();
         profiles = new UserProfileManager();
+
+        // register the logged-in user as a profile
+        profiles.addProfile(loginName);
+        profiles.switchUser(loginName);
 
         // step 2: try to start the microphone
         audio = new AudioStuff();
@@ -87,7 +98,7 @@ public class Main extends JFrame {
         }
 
         // step 3: setup the window itself
-        setTitle("Assistatron 5000 v2.0  |  TSA Software Development 2026");
+        setTitle("Assistatron 5000  —  Hello, " + loginName + "!");
         setSize(960, 680);
         setMinimumSize(new Dimension(750, 500));
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
@@ -145,8 +156,8 @@ public class Main extends JFrame {
         // bottom: status bar
         add(buildStatusBar(), BorderLayout.SOUTH);
 
-        // start on deaf mode
-        switchMode("DEAF");
+        // start on the mode the user chose at login
+        switchMode(loginMode);
     }
 
     // ── HEADER ────────────────────────────────────────────────────────
@@ -217,8 +228,8 @@ public class Main extends JFrame {
         JPanel rightSide = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
         rightSide.setBackground(C_PANEL);
 
-        JLabel userLbl = new JLabel("👤  " + profiles.getCurrentName());
-        userLbl.setFont(new Font("Arial", Font.PLAIN, 13));
+        JLabel userLbl = new JLabel("👤  " + loginName);
+        userLbl.setFont(new Font("Arial", Font.BOLD, 13));
         userLbl.setForeground(C_TEXT);
 
         JButton settingsBtn = new JButton("⚙");
@@ -262,7 +273,7 @@ public class Main extends JFrame {
         modeLbl.setFont(new Font("Arial", Font.BOLD, 11));
         modeLbl.setForeground(C_BLUE);
 
-        statsLbl = new JLabel("no alerts yet");
+        statsLbl = new JLabel("Welcome, " + loginName + "!  No alerts yet.");
         statsLbl.setFont(new Font("Arial", Font.PLAIN, 11));
         statsLbl.setForeground(C_SUBTEXT);
 
@@ -504,17 +515,8 @@ public class Main extends JFrame {
         ArrayList<String[]> missing = new ArrayList<>();
         // each entry: { toolName, macInstructions, windowsInstructions, whatItDoes }
 
-        // check camera tool
-        if (isMac) {
-            if (BlindMode.findImagesnap() == null) {
-                missing.add(new String[]{
-                    "imagesnap  (camera capture)",
-                    "brew install imagesnap\n(need Homebrew first: brew.sh)",
-                    "N/A — imagesnap is mac only",
-                    "lets blind mode take real photos with your webcam"
-                });
-            }
-        } else if (isWin) {
+        // check camera tool (now uses opencv via python, so just check python+cv2)
+        if (isWin) {
             if (findFfmpegWin() == null) {
                 missing.add(new String[]{
                     "ffmpeg  (camera capture)",
@@ -596,134 +598,202 @@ public class Main extends JFrame {
     }
 
     void showMissingToolsDialog(ArrayList<String[]> missing) {
-        JDialog dlg = new JDialog(this, "Setup Required — Missing Tools", true);
-        dlg.setSize(520, 420);
-        dlg.setLocationRelativeTo(this);
+        StringBuilder msg = new StringBuilder("Some features need extra tools:\n\n");
+        for (String[] tool : missing) {
+            msg.append("• ").append(tool[0]).append("\n");
+            msg.append("  Mac:     ").append(tool[1].replace("\n", "\n           ")).append("\n");
+            msg.append("  Windows: ").append(tool[2].replace("\n", "\n           ")).append("\n\n");
+        }
+        msg.append("Restart the app after installing.");
+        JOptionPane.showMessageDialog(this, msg.toString(), "Setup Required", JOptionPane.WARNING_MESSAGE);
+    }
+
+    // ── LOGIN SCREEN ──────────────────────────────────────────────────
+    static void showLoginScreen(LoginCallback cb) {
+        // colors (same palette as the rest of the app)
+        Color BG      = new Color(13, 13, 23);
+        Color CARD    = new Color(22, 22, 38);
+        Color BORDER  = new Color(45, 45, 68);
+        Color BLUE    = new Color(64, 156, 255);
+        Color PURPLE  = new Color(160, 110, 255);
+        Color TEXT    = new Color(220, 220, 240);
+        Color SUBTEXT = new Color(115, 115, 140);
+
+        JFrame lf = new JFrame("Assistatron 5000");
+        lf.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        lf.setSize(460, 540);
+        lf.setMinimumSize(new Dimension(400, 480));
+        lf.setLocationRelativeTo(null);
+        lf.getContentPane().setBackground(BG);
+        lf.setLayout(new BorderLayout());
 
         JPanel content = new JPanel();
-        content.setBackground(new Color(14, 14, 26));
+        content.setBackground(BG);
         content.setLayout(new BoxLayout(content, BoxLayout.Y_AXIS));
-        content.setBorder(BorderFactory.createEmptyBorder(18, 20, 10, 20));
+        content.setBorder(BorderFactory.createEmptyBorder(44, 50, 36, 50));
 
-        JLabel header = new JLabel("⚠  Some features need extra tools installed");
-        header.setFont(new Font("Arial", Font.BOLD, 15));
-        header.setForeground(new Color(255, 200, 50));
-        header.setAlignmentX(Component.LEFT_ALIGNMENT);
-        content.add(header);
+        // ── logo ──
+        JLabel logo = new JLabel("♿  Assistatron 5000");
+        logo.setFont(new Font("Arial", Font.BOLD, 26));
+        logo.setForeground(BLUE);
+        logo.setAlignmentX(Component.CENTER_ALIGNMENT);
+        content.add(logo);
 
-        JLabel sub = new JLabel("the app still runs but these features wont work without them:");
-        sub.setFont(new Font("Arial", Font.ITALIC, 11));
-        sub.setForeground(new Color(110, 110, 140));
-        sub.setAlignmentX(Component.LEFT_ALIGNMENT);
-        content.add(sub);
-        content.add(Box.createVerticalStrut(16));
+        JLabel tagline = new JLabel("Assistive Technology Platform");
+        tagline.setFont(new Font("Arial", Font.ITALIC, 12));
+        tagline.setForeground(SUBTEXT);
+        tagline.setAlignmentX(Component.CENTER_ALIGNMENT);
+        content.add(tagline);
+        content.add(Box.createVerticalStrut(38));
 
-        String os = System.getProperty("os.name").toLowerCase();
-        boolean isMac = os.contains("mac");
+        // ── name field ──
+        JLabel namePrompt = new JLabel("What's your name?");
+        namePrompt.setFont(new Font("Arial", Font.BOLD, 15));
+        namePrompt.setForeground(TEXT);
+        namePrompt.setAlignmentX(Component.CENTER_ALIGNMENT);
+        content.add(namePrompt);
+        content.add(Box.createVerticalStrut(10));
 
-        for (String[] tool : missing) {
-            // tool card
-            JPanel card = new JPanel();
-            card.setBackground(new Color(22, 22, 38));
-            card.setLayout(new BoxLayout(card, BoxLayout.Y_AXIS));
-            card.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(new Color(255, 90, 90, 80), 1),
-                BorderFactory.createEmptyBorder(10, 12, 10, 12)
-            ));
-            card.setAlignmentX(Component.LEFT_ALIGNMENT);
-            card.setMaximumSize(new Dimension(99999, 200));
+        JTextField nameField = new JTextField();
+        nameField.setMaximumSize(new Dimension(320, 40));
+        nameField.setPreferredSize(new Dimension(320, 40));
+        nameField.setBackground(CARD);
+        nameField.setForeground(TEXT);
+        nameField.setCaretColor(TEXT);
+        nameField.setFont(new Font("Arial", Font.PLAIN, 15));
+        nameField.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(BLUE, 1),
+            BorderFactory.createEmptyBorder(6, 12, 6, 12)));
+        nameField.setAlignmentX(Component.CENTER_ALIGNMENT);
+        content.add(nameField);
+        content.add(Box.createVerticalStrut(30));
 
-            JLabel nameLbl = new JLabel("❌  " + tool[0]);
-            nameLbl.setFont(new Font("Arial", Font.BOLD, 13));
-            nameLbl.setForeground(new Color(255, 100, 100));
-            nameLbl.setAlignmentX(Component.LEFT_ALIGNMENT);
-            card.add(nameLbl);
+        // ── mode selection ──
+        JLabel modePrompt = new JLabel("How can we help you today?");
+        modePrompt.setFont(new Font("Arial", Font.BOLD, 15));
+        modePrompt.setForeground(TEXT);
+        modePrompt.setAlignmentX(Component.CENTER_ALIGNMENT);
+        content.add(modePrompt);
+        content.add(Box.createVerticalStrut(14));
 
-            JLabel whatLbl = new JLabel("what it does: " + tool[3]);
-            whatLbl.setFont(new Font("Arial", Font.ITALIC, 11));
-            whatLbl.setForeground(new Color(110, 110, 140));
-            whatLbl.setAlignmentX(Component.LEFT_ALIGNMENT);
-            card.add(whatLbl);
-            card.add(Box.createVerticalStrut(7));
+        // track which card is selected — default to DEAF
+        final String[] selectedMode = {"DEAF"};
 
-            // mac instructions
-            JLabel macTitle = new JLabel("🍎  Mac:");
-            macTitle.setFont(new Font("Arial", Font.BOLD, 11));
-            macTitle.setForeground(new Color(82, 168, 255));
-            macTitle.setAlignmentX(Component.LEFT_ALIGNMENT);
-            card.add(macTitle);
-            for (String line : tool[1].split("\n")) {
-                JLabel l = new JLabel("   " + line);
-                l.setFont(new Font("Monospaced", Font.PLAIN, 11));
-                l.setForeground(new Color(52, 211, 105));
-                l.setAlignmentX(Component.LEFT_ALIGNMENT);
-                card.add(l);
+        // helper: build one of the two big clickable mode cards
+        // returns the card panel; border highlight is updated by the click handler below
+        JPanel hearingCard = new JPanel();
+        hearingCard.setLayout(new BoxLayout(hearingCard, BoxLayout.Y_AXIS));
+        hearingCard.setBackground(CARD);
+        hearingCard.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(BLUE, 2),         // starts selected
+            BorderFactory.createEmptyBorder(14, 10, 14, 10)));
+        hearingCard.setCursor(new Cursor(Cursor.HAND_CURSOR));
+
+        JLabel hIcon = new JLabel("🔊"); hIcon.setFont(new Font("Dialog", Font.PLAIN, 30)); hIcon.setAlignmentX(Component.CENTER_ALIGNMENT);
+        JLabel hTitle = new JLabel("Hearing"); hTitle.setFont(new Font("Arial", Font.BOLD, 14)); hTitle.setForeground(BLUE); hTitle.setAlignmentX(Component.CENTER_ALIGNMENT);
+        JLabel hSub = new JLabel("Impairment"); hSub.setFont(new Font("Arial", Font.PLAIN, 11)); hSub.setForeground(SUBTEXT); hSub.setAlignmentX(Component.CENTER_ALIGNMENT);
+        hearingCard.add(hIcon); hearingCard.add(Box.createVerticalStrut(5)); hearingCard.add(hTitle); hearingCard.add(hSub);
+
+        JPanel visualCard = new JPanel();
+        visualCard.setLayout(new BoxLayout(visualCard, BoxLayout.Y_AXIS));
+        visualCard.setBackground(CARD);
+        visualCard.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(BORDER, 2),       // starts unselected
+            BorderFactory.createEmptyBorder(14, 10, 14, 10)));
+        visualCard.setCursor(new Cursor(Cursor.HAND_CURSOR));
+
+        JLabel vIcon = new JLabel("👁"); vIcon.setFont(new Font("Dialog", Font.PLAIN, 30)); vIcon.setAlignmentX(Component.CENTER_ALIGNMENT);
+        JLabel vTitle = new JLabel("Visual"); vTitle.setFont(new Font("Arial", Font.BOLD, 14)); vTitle.setForeground(PURPLE); vTitle.setAlignmentX(Component.CENTER_ALIGNMENT);
+        JLabel vSub = new JLabel("Impairment"); vSub.setFont(new Font("Arial", Font.PLAIN, 11)); vSub.setForeground(SUBTEXT); vSub.setAlignmentX(Component.CENTER_ALIGNMENT);
+        visualCard.add(vIcon); visualCard.add(Box.createVerticalStrut(5)); visualCard.add(vTitle); visualCard.add(vSub);
+
+        // click handlers — highlight selected, dim the other
+        hearingCard.addMouseListener(new MouseAdapter() {
+            public void mouseClicked(MouseEvent e) {
+                selectedMode[0] = "DEAF";
+                hearingCard.setBorder(BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(BLUE,   2), BorderFactory.createEmptyBorder(14,10,14,10)));
+                visualCard .setBorder(BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(BORDER, 2), BorderFactory.createEmptyBorder(14,10,14,10)));
             }
-            card.add(Box.createVerticalStrut(5));
-
-            // windows instructions
-            JLabel winTitle = new JLabel("🪟  Windows:");
-            winTitle.setFont(new Font("Arial", Font.BOLD, 11));
-            winTitle.setForeground(new Color(82, 168, 255));
-            winTitle.setAlignmentX(Component.LEFT_ALIGNMENT);
-            card.add(winTitle);
-            for (String line : tool[2].split("\n")) {
-                JLabel l = new JLabel("   " + line);
-                l.setFont(new Font("Monospaced", Font.PLAIN, 11));
-                l.setForeground(new Color(52, 211, 105));
-                l.setAlignmentX(Component.LEFT_ALIGNMENT);
-                card.add(l);
+            public void mouseEntered(MouseEvent e) { if (!"DEAF".equals(selectedMode[0])) hearingCard.setBackground(new Color(28,28,48)); }
+            public void mouseExited (MouseEvent e) { if (!"DEAF".equals(selectedMode[0])) hearingCard.setBackground(CARD); }
+        });
+        visualCard.addMouseListener(new MouseAdapter() {
+            public void mouseClicked(MouseEvent e) {
+                selectedMode[0] = "BLIND";
+                visualCard .setBorder(BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(PURPLE, 2), BorderFactory.createEmptyBorder(14,10,14,10)));
+                hearingCard.setBorder(BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(BORDER, 2), BorderFactory.createEmptyBorder(14,10,14,10)));
             }
+            public void mouseEntered(MouseEvent e) { if (!"BLIND".equals(selectedMode[0])) visualCard.setBackground(new Color(28,28,48)); }
+            public void mouseExited (MouseEvent e) { if (!"BLIND".equals(selectedMode[0])) visualCard.setBackground(CARD); }
+        });
 
-            content.add(card);
-            content.add(Box.createVerticalStrut(10));
-        }
+        JPanel modeRow = new JPanel(new GridLayout(1, 2, 14, 0));
+        modeRow.setBackground(BG);
+        modeRow.setMaximumSize(new Dimension(320, 115));
+        modeRow.setAlignmentX(Component.CENTER_ALIGNMENT);
+        modeRow.add(hearingCard);
+        modeRow.add(visualCard);
+        content.add(modeRow);
+        content.add(Box.createVerticalStrut(24));
 
-        JLabel restartNote = new JLabel("after installing, restart the app for changes to take effect");
-        restartNote.setFont(new Font("Arial", Font.ITALIC, 10));
-        restartNote.setForeground(new Color(90, 90, 120));
-        restartNote.setAlignmentX(Component.LEFT_ALIGNMENT);
-        content.add(restartNote);
+        // error label
+        JLabel errorLbl = new JLabel(" ");
+        errorLbl.setFont(new Font("Arial", Font.ITALIC, 12));
+        errorLbl.setForeground(new Color(255, 85, 85));
+        errorLbl.setAlignmentX(Component.CENTER_ALIGNMENT);
+        content.add(errorLbl);
+        content.add(Box.createVerticalStrut(6));
 
-        JScrollPane scroll = new JScrollPane(content);
-        scroll.setBorder(null);
-        scroll.getViewport().setBackground(new Color(14, 14, 26));
+        // submit button
+        JButton goBtn = new JButton("Let's Go  →");
+        goBtn.setFont(new Font("Arial", Font.BOLD, 15));
+        goBtn.setBackground(BLUE);
+        goBtn.setForeground(Color.WHITE);
+        goBtn.setFocusPainted(false);
+        goBtn.setBorderPainted(false);
+        goBtn.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        goBtn.setMaximumSize(new Dimension(200, 44));
+        goBtn.setAlignmentX(Component.CENTER_ALIGNMENT);
+        goBtn.addMouseListener(new MouseAdapter() {
+            public void mouseEntered(MouseEvent e) { goBtn.setBackground(BLUE.brighter()); }
+            public void mouseExited (MouseEvent e) { goBtn.setBackground(BLUE); }
+        });
 
-        JButton okBtn = new JButton("Got it, close");
-        okBtn.setBackground(new Color(82, 168, 255));
-        okBtn.setForeground(Color.WHITE);
-        okBtn.setFont(new Font("Arial", Font.BOLD, 12));
-        okBtn.setFocusPainted(false);
-        okBtn.setBorderPainted(false);
-        okBtn.addActionListener(e -> dlg.dispose());
+        ActionListener submit = e -> {
+            String name = nameField.getText().trim();
+            if (name.isEmpty()) { errorLbl.setText("Please enter your name first!"); return; }
+            lf.dispose();
+            cb.onLogin(name, selectedMode[0]);
+        };
+        goBtn.addActionListener(submit);
+        nameField.addActionListener(submit); // enter key submits too
 
-        JPanel btnRow = new JPanel();
-        btnRow.setBackground(new Color(14, 14, 26));
-        btnRow.add(okBtn);
+        content.add(goBtn);
 
-        dlg.setLayout(new BorderLayout());
-        dlg.add(scroll,  BorderLayout.CENTER);
-        dlg.add(btnRow,  BorderLayout.SOUTH);
-        dlg.setVisible(true);
+        lf.add(content, BorderLayout.CENTER);
+        lf.setVisible(true);
+        nameField.requestFocusInWindow();
     }
 
     // ── MAIN METHOD ───────────────────────────────────────────────────
     public static void main(String[] args) {
-        // swing needs to run on the Event Dispatch Thread (EDT)
-        // if u dont do this it crashes in weird random ways
-        // learned this the hard way (spent 2 hours debugging it)
-        SwingUtilities.invokeLater(new Runnable() {
-            public void run() {
-                // try to use the OS look and feel so it doesnt look so default java
-                try {
-                    UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-                } catch (Exception e) {
-                    // whatever if it fails it still works
-                    System.out.println("look and feel failed: " + e.getMessage());
-                }
-
-                new Main().setVisible(true);
+        SwingUtilities.invokeLater(() -> {
+            try {
+                UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+            } catch (Exception e) {
+                System.out.println("look and feel failed: " + e.getMessage());
             }
+
+            // show login screen first; when the user submits it creates the main window
+            showLoginScreen((name, mode) -> {
+                Main app = new Main(name, mode);
+                app.setVisible(true);
+                // personalized TTS greeting
+                String greeting = "DEAF".equals(mode)
+                    ? "Welcome " + name + ". Deaf mode is active."
+                    : "Welcome " + name + ". Blind mode is active. Press Start Scanning to begin.";
+                AudioStuff.speak(greeting);
+            });
         });
     }
 }

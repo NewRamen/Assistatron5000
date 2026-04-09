@@ -1,9 +1,9 @@
-import javax.swing.*;
 import java.awt.*;
 import java.awt.event.*;
 import java.io.*;
 import java.util.*;
 import java.util.List;
+import javax.swing.*;
 
 // DeafMode.java
 // does audio monitoring + speech to text
@@ -55,25 +55,21 @@ public class DeafMode extends JPanel {
 
     // this is for filtering/detection only - same thing parental controls do
     // if ur reading this ms johnson this is educational content moderation
+    // NOTE: removed "hell", "damn", "ass", "dick", "prick" — too many false positives
+    // (hello, damn good, class, dictionary, Patrick — all got flagged)
     static final Set<String> BAD_WORDS = new HashSet<>(Arrays.asList(
-        "fuck", "shit", "ass", "bitch", "damn", "hell", "crap",
-        "bastard", "cunt", "dick", "piss", "cock", "whore",
-        "fag", "retard", "bloody", "bollocks", "wanker", "prick"
+        "fuck", "shit", "bitch", "crap",
+        "bastard", "cunt", "piss", "cock", "whore",
+        "fag", "retard", "bollocks", "wanker"
     ));
 
     // funny messages that rotate when bad word is detected
     // these are NOT corny i promise
     static final String[] SNITCH_MSGS = {
-        "sir this is a wendy's",
-        "bro... really? 💀",
-        "POV: ur teacher overheard you",
-        "mother of pearl!!",
+        "watch your language!",
+        "bro really? 💀",
         "your grandma is disappointed",
-        "the wifi router can HEAR YOU",
-        "adding this to ur permanent record",
-        "FBI has entered the chat",
-        "oh? OH?? OH!!!",
-        "bro fell off 📉"
+        "adding this to ur permanent record"
     };
     static int snitchMsgIdx = 0;
 
@@ -631,13 +627,11 @@ public class DeafMode extends JPanel {
         String displayResult = result; // start with original
 
         for (String bw : BAD_WORDS) {
-            // check if this bad word appears in the text
-            if (lower.contains(bw)) {
+            // use word boundary \b so "hell" doesn't match "hello", "ass" doesn't match "class", etc.
+            String pattern = "(?i)\\b" + java.util.regex.Pattern.quote(bw) + "\\b";
+            if (lower.matches(".*\\b" + java.util.regex.Pattern.quote(bw) + "\\b.*")) {
                 foundBadWords.add(bw);
-                // censor it - replace with first letter + asterisks + last letter
-                String censored = censorWord(bw);
-                // case insensitive replace
-                displayResult = displayResult.replaceAll("(?i)" + bw, censored);
+                displayResult = displayResult.replaceAll(pattern, censorWord(bw));
             }
         }
 
@@ -700,7 +694,7 @@ public class DeafMode extends JPanel {
         reset.start();
     }
 
-    // censors a word: "fuck" → "f**k"
+    // censors a word: "fuc*" → "f**k"
     String censorWord(String word) {
         if (word == null || word.isEmpty()) return "*";
         if (word.length() == 1) return "*";
