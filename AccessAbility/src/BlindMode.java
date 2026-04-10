@@ -32,6 +32,12 @@ public class BlindMode extends JPanel {
     int     scanRateCob   = 4000, totalScans = 0;
     Random  randGlonk     = new Random();
     boolean imagensnapAvail = false;
+    // per-object cooldown — each label gets its own timer
+    // so a brand new object always announces instantly,
+    // but the same object wont spam every scan
+    HashMap<String, Long> announceTimes = new HashMap<>();
+    static final int COOLDOWN_NORMAL = 15000; // 15s between same non-danger object
+    static final int COOLDOWN_DANGER = 4000;  // 4s between same danger object
     ArrayList<String>       lastDetected = new ArrayList<>();
     ArrayList<DetectionBox> currentBoxes = new ArrayList<>();
 
@@ -84,24 +90,55 @@ public class BlindMode extends JPanel {
     // writes python capture+detect script to temp file
     // the script opens the camera, keeps frames in memory, and runs yolo on demand
     void writeDetectScript() {
+        // 3-thread design so YOLO detection never blocks the live preview:
+        //   capture_loop  — reads camera as fast as possible, no sleep, keeps latest_frame fresh
+        //   write_loop    — writes latest frame to disk at ~30fps independently
+        //   main thread   — blocks on stdin waiting for detect commands, runs YOLO when asked
         String script =
-            "import sys, os, threading, time\n" +
-            "try:\n    import cv2\n    from ultralytics import YOLO\nexcept ImportError as e:\n    sys.stdout.write('__NO_LIB__\\n'); sys.stdout.flush(); sys.exit(1)\n" +
+            "import sys, threading, time\n" +
+            "try:\n    import cv2\n    from ultralytics import YOLO\n" +
+            "except ImportError:\n    sys.stdout.write('__NO_LIB__\\n'); sys.stdout.flush(); sys.exit(1)\n" +
             "LIVE_PATH = '/tmp/aa_live.jpg'\n" +
-            "try:\n    model = YOLO('yolov8n.pt')\nexcept Exception as e:\n    sys.stdout.write('__ERR__:' + str(e) + '\\n'); sys.stdout.flush(); sys.exit(1)\n" +
+            "try:\n    model = YOLO('yolov8s.pt')\n" +
+            "except Exception as e:\n    sys.stdout.write('__ERR__:'+str(e)+'\\n'); sys.stdout.flush(); sys.exit(1)\n" +
             "cap = cv2.VideoCapture(0)\n" +
             "if not cap.isOpened():\n    sys.stdout.write('__NO_CAM__\\n'); sys.stdout.flush(); sys.exit(1)\n" +
-            "cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)\ncap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)\ncap.set(cv2.CAP_PROP_FPS, 30)\n" +
+            "cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640); cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480); cap.set(cv2.CAP_PROP_FPS, 30)\n" +
             "latest_frame = [None]\nframe_lock = threading.Lock()\n" +
-            "def capture_loop():\n    while True:\n        ret, frame = cap.read()\n        if ret:\n            with frame_lock:\n                latest_frame[0] = frame.copy()\n            try:\n                cv2.imwrite(LIVE_PATH, frame, [cv2.IMWRITE_JPEG_QUALITY, 80])\n            except Exception:\n                pass\n        time.sleep(0.05)\n" +
-            "t = threading.Thread(target=capture_loop, daemon=True)\nt.start()\ntime.sleep(0.8)\nsys.stdout.write('__READY__\\n'); sys.stdout.flush()\n" +
-            "for line in sys.stdin:\n    cmd = line.strip()\n    if not cmd: continue\n    if cmd == '__QUIT__': break\n" +
-            "    with frame_lock:\n        frame = latest_frame[0].copy() if latest_frame[0] is not None else None\n" +
+            // capture thread: reads camera as fast as it can, no sleep
+            "def capture_loop():\n" +
+            "    while True:\n" +
+            "        ret, frame = cap.read()\n" +
+            "        if ret:\n" +
+            "            with frame_lock: latest_frame[0] = frame\n" +
+            // write thread: encodes and saves to disk at 30fps, never blocks capture
+            "def write_loop():\n" +
+            "    while True:\n" +
+            "        with frame_lock: f = latest_frame[0]\n" +
+            "        if f is not None:\n" +
+            "            try: cv2.imwrite(LIVE_PATH, f, [cv2.IMWRITE_JPEG_QUALITY, 70])\n" +
+            "            except Exception: pass\n" +
+            "        time.sleep(0.033)\n" +
+            "threading.Thread(target=capture_loop, daemon=True).start()\n" +
+            "threading.Thread(target=write_loop,   daemon=True).start()\n" +
+            "time.sleep(0.8)\nsys.stdout.write('__READY__\\n'); sys.stdout.flush()\n" +
+            // main thread: waits for detect commands, runs YOLO on latest in-memory frame
+            "for line in sys.stdin:\n" +
+            "    cmd = line.strip()\n" +
+            "    if not cmd: continue\n" +
+            "    if cmd == '__QUIT__': break\n" +
+            "    with frame_lock: frame = latest_frame[0].copy() if latest_frame[0] is not None else None\n" +
             "    if frame is None:\n        sys.stdout.write('__NO_IMAGE__\\n__DONE__\\n'); sys.stdout.flush(); continue\n" +
-            "    try:\n        results = model(frame, verbose=False, conf=0.35)\n        found = 0\n" +
-            "        for r in results:\n            for box in r.boxes:\n                cls  = r.names[int(box.cls[0])]\n                conf = float(box.conf[0])\n                x1,y1,x2,y2 = [int(v) for v in box.xyxy[0].tolist()]\n                sys.stdout.write(f'{cls},{conf:.2f},{x1},{y1},{x2-x1},{y2-y1}\\n')\n                found += 1\n" +
-            "        if found == 0: sys.stdout.write('__NONE__\\n')\n        sys.stdout.write('__DONE__\\n'); sys.stdout.flush()\n" +
-            "    except Exception as e:\n        sys.stdout.write('__ERR__:' + str(e) + '\\n__DONE__\\n'); sys.stdout.flush()\n" +
+            "    try:\n" +
+            "        results = model(frame, verbose=False, conf=0.50)\n" +
+            "        found = 0\n" +
+            "        for r in results:\n" +
+            "            for box in r.boxes:\n" +
+            "                cls=r.names[int(box.cls[0])]; conf=float(box.conf[0])\n" +
+            "                x1,y1,x2,y2=[int(v) for v in box.xyxy[0].tolist()]\n" +
+            "                sys.stdout.write(f'{cls},{conf:.2f},{x1},{y1},{x2-x1},{y2-y1}\\n'); found+=1\n" +
+            "        sys.stdout.write('__NONE__\\n' if found==0 else ''); sys.stdout.write('__DONE__\\n'); sys.stdout.flush()\n" +
+            "    except Exception as e:\n        sys.stdout.write('__ERR__:'+str(e)+'\\n__DONE__\\n'); sys.stdout.flush()\n" +
             "cap.release()\n";
         try {
             String path = System.getProperty("java.io.tmpdir") + File.separator + "aa_detect.py";
@@ -269,7 +306,6 @@ public class BlindMode extends JPanel {
         p.add(startBtn); p.add(stopBtn);
         p.add(btn("📢  Announce", C_BLUE,  Color.WHITE, e->announceNow()));
         p.add(btn("🗑  Clear Log", C_CARD2, C_TEXT, e->{ logArea.setText("[ cleared ]\n"); totalScans=0; scanCountLbl.setText("Scans: 0"); }));
-        p.add(btn("🏃  FLEE!!!",  new Color(180,30,30), Color.WHITE, e->{ AudioStuff.speakWarning("DANGER! EVACUATE IMMEDIATELY! RUN!"); statusLbl.setText("🚨 EVACUATING!!!"); statusLbl.setForeground(C_RED); }));
         JLabel envLbl = new JLabel("  Env:"); envLbl.setForeground(C_SUBTEXT); envLbl.setFont(new Font("Arial",Font.PLAIN,11));
         envPicker = new JComboBox<>(new String[]{"Indoor","Outdoor"});
         envPicker.setBackground(C_CARD2); envPicker.setForeground(C_TEXT); envPicker.setFont(new Font("Arial",Font.PLAIN,12));
@@ -293,6 +329,7 @@ public class BlindMode extends JPanel {
 
     void stopScanning() {
         belloScanning = false; stopLiveCapture(); startBtn.setEnabled(true); stopBtn.setEnabled(false);
+        announceTimes.clear(); // reset cooldowns so first detection after restart announces right away
         setPill(statusLbl,"● Stopped",C_SUBTEXT,new Color(118,118,148,28),new Color(118,118,148,60));
         bigObjectLbl.setText("—"); bigObjectLbl.setForeground(C_SUBTEXT); distanceLbl.setText("—"); directionLbl.setText("direction: —");
         proximityBar.setValue(0); proximityBar.setString("Scan stopped"); proxDescLbl.setText("Press Start to resume"); proxDescLbl.setForeground(C_SUBTEXT);
@@ -356,14 +393,20 @@ public class BlindMode extends JPanel {
         else if (prox>30) { proximityBar.setForeground(C_YELLOW); proximityBar.setString("Moderate: "+String.format("%.1f",dist)+"m"); proxDescLbl.setText("Moderate distance"); proxDescLbl.setForeground(C_YELLOW); }
         else              { proximityBar.setForeground(C_GREEN);  proximityBar.setString("Safe: "+String.format("%.1f",dist)+"m"); proxDescLbl.setText("Safe distance"); proxDescLbl.setForeground(C_GREEN); }
         boolean isDanger = DANGER_SET.contains(near) && dist < 3.0;
-        if (isDanger) {
-            AudioStuff.speakWarning(String.format("Warning! %s ahead, %.1f meters!",near,dist));
+        long now = System.currentTimeMillis();
+        long lastTime = announceTimes.getOrDefault(near, 0L);
+        int cooldown = isDanger ? COOLDOWN_DANGER : COOLDOWN_NORMAL;
+        boolean canAnnounce = (now - lastTime) > cooldown;
+        if (isDanger && canAnnounce) {
+            AudioStuff.speakWarning(String.format("%s ahead, %.1f meters!",near,dist));
             alerts.addAlert(new Alert(Alert.AlertType.BLIND_WARNING,"DANGER: "+near+" @ "+String.format("%.1f",dist)+"m",3,near));
-        } else {
+            announceTimes.put(near, now);
+        } else if (!isDanger && canAnnounce) {
             String ann = near+", "+dir+", "+String.format("%.1f",dist)+" meters";
             if (lastDetected.size()>1) ann += ", also "+lastDetected.get(1);
             AudioStuff.speak(ann);
             alerts.addAlert(new Alert(Alert.AlertType.BLIND_OBJECT,near+" @ "+String.format("%.1f",dist)+"m",1,near));
+            announceTimes.put(near, now);
         }
         totalScans++; scanCountLbl.setText("Scans: "+totalScans);
         logArea.append((isDanger?"🚨 ":"")+(yoloAvail?"[AI]":"[sim]")+" ["+totalScans+"] "+near+" @ "+String.format("%.1f",dist)+"m "+dir+"\n");

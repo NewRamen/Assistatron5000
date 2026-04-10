@@ -144,7 +144,7 @@ public class Main extends JFrame {
     JButton makeIconBtn(String text, String tip, ActionListener a) {
         JButton b = new JButton(text);
         b.setFont(new Font("Arial", Font.PLAIN, 16)); b.setBackground(C_PANEL); b.setForeground(C_TEXT);
-        b.setBorderPainted(false); b.setFocusPainted(false);
+        b.setOpaque(true); b.setBorderPainted(false); b.setFocusPainted(false);
         b.setCursor(new Cursor(Cursor.HAND_CURSOR)); b.setToolTipText(tip); b.addActionListener(a); return b;
     }
 
