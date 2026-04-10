@@ -7,8 +7,8 @@ import javax.swing.*;
 
 // DeafMode.java — audio monitoring + speech-to-text panel
 // listens to mic, shows visual alerts when sounds get loud
-// STT runs via python (googles free api, needs wifi)
-// NOTE: pip3 install SpeechRecognition pyaudio for STT to work
+// STT uses whisper (local, no internet!) with google as fallback
+// NOTE: pip3 install openai-whisper SpeechRecognition pyaudio
 
 public class DeafMode extends JPanel {
 
@@ -28,6 +28,11 @@ public class DeafMode extends JPanel {
     int     threshCorn   = 65;
     boolean alertGoingOn = false, sttActive = false;
     int     cussCount    = 0;
+    // persistent whisper process — model loads once so its fast after first use
+    Process        sttProc   = null;
+    BufferedWriter sttStdin  = null;
+    BufferedReader sttStdout = null;
+    boolean        whisperOk = false;
     javax.swing.Timer simTimer, flashTimer;
     int     flashCob     = 0;
     double  avgLevel     = 0.0;
@@ -54,6 +59,8 @@ public class DeafMode extends JPanel {
         add(makeSplitBody(), BorderLayout.CENTER);
         add(makeBottomBar(), BorderLayout.SOUTH);
         hookUpAudio(); startSimTimer();
+        // start whisper process in background so its ready by the time user clicks listen
+        new Thread(() -> startSttProcess()).start();
         System.out.println("[DeafMode] ready, STT + bad word detection loaded");
     }
 
@@ -233,15 +240,79 @@ public class DeafMode extends JPanel {
         reset.setRepeats(false); reset.start();
     }
 
+    // starts the persistent whisper process — model loads once so after first click its fast
+    void startSttProcess() {
+        if (sttProc != null) return;
+        String script =
+            "import sys, os, tempfile\n" +
+            "sys.stdout.reconfigure(line_buffering=True)\n" +
+            "try:\n" +
+            "    import whisper, speech_recognition as sr\n" +
+            "    model = whisper.load_model('tiny.en')\n" +  // tiny.en = fast + english only
+            "    r = sr.Recognizer()\n" +
+            "    r.pause_threshold = 3.5\n" +        // wait 3.5s of silence before stopping
+            "    r.non_speaking_duration = 0.8\n" +  // keep a bit of silence at the end
+            "    r.dynamic_energy_threshold = False\n" + // dont auto-adjust — causes early cutoff
+            "    r.energy_threshold = 300\n" +        // fixed sensitivity, works in most rooms
+            "    sys.stdout.write('WHISPER_READY\\n'); sys.stdout.flush()\n" +
+            "    while True:\n" +
+            "        cmd = sys.stdin.readline().strip()\n" +
+            "        if cmd != 'listen': break\n" +
+            "        try:\n" +
+            "            with sr.Microphone() as src:\n" +
+            "                r.adjust_for_ambient_noise(src, duration=0.2)\n" +
+            "                audio = r.listen(src, timeout=15, phrase_time_limit=45)\n" +
+            "            tmp = tempfile.mktemp(suffix='.wav')\n" +
+            "            with open(tmp,'wb') as f: f.write(audio.get_wav_data())\n" +
+            "            res = model.transcribe(tmp, language='en')\n" +
+            "            os.unlink(tmp)\n" +
+            "            txt = res['text'].strip()\n" +
+            "            sys.stdout.write((txt if txt else '__SILENT__') + '\\n'); sys.stdout.flush()\n" +
+            "        except Exception as ex: sys.stdout.write('__ERR__\\n'); sys.stdout.flush()\n" +
+            "except ImportError:\n" +  // whisper not installed — fall back to google
+            "    try:\n" +
+            "        import speech_recognition as sr\n" +
+            "        r = sr.Recognizer()\n" +
+            "        r.pause_threshold = 3.5\n" +
+            "        r.non_speaking_duration = 0.8\n" +
+            "        r.dynamic_energy_threshold = False\n" +
+            "        r.energy_threshold = 300\n" +
+            "        sys.stdout.write('GOOGLE_READY\\n'); sys.stdout.flush()\n" +
+            "        while True:\n" +
+            "            cmd = sys.stdin.readline().strip()\n" +
+            "            if cmd != 'listen': break\n" +
+            "            try:\n" +
+            "                with sr.Microphone() as src:\n" +
+            "                    r.adjust_for_ambient_noise(src, duration=0.2)\n" +
+            "                    audio = r.listen(src, timeout=15, phrase_time_limit=45)\n" +
+            "                sys.stdout.write(r.recognize_google(audio) + '\\n'); sys.stdout.flush()\n" +
+            "            except sr.UnknownValueError: sys.stdout.write('__UNCLEAR__\\n'); sys.stdout.flush()\n" +
+            "            except sr.RequestError:     sys.stdout.write('__NO_NET__\\n');  sys.stdout.flush()\n" +
+            "            except Exception:           sys.stdout.write('__ERR__\\n');     sys.stdout.flush()\n" +
+            "    except ImportError: sys.stdout.write('__NO_LIB__\\n'); sys.stdout.flush()\n" +
+            "except Exception: sys.stdout.write('__ERR__\\n'); sys.stdout.flush()\n";
+        try {
+            File f = new File("/tmp/aa_stt.py");
+            PrintWriter pw = new PrintWriter(new FileWriter(f)); pw.print(script); pw.close();
+            sttProc   = Runtime.getRuntime().exec(new String[]{"python3", "/tmp/aa_stt.py"});
+            sttStdin  = new BufferedWriter(new OutputStreamWriter(sttProc.getOutputStream()));
+            sttStdout = new BufferedReader(new InputStreamReader(sttProc.getInputStream()));
+            String ready = sttStdout.readLine();
+            whisperOk = "WHISPER_READY".equals(ready);
+            System.out.println("[STT] process ready — " + ready);
+        } catch (Exception e) { System.out.println("[STT] failed to start: " + e.getMessage()); sttProc = null; }
+    }
+
     void startSTT() {
         if (sttActive) { sttStatusLbl.setText("Already listening!! wait for it to finish"); return; }
         sttActive = true;
         listenBtn.setText("🔴  Listening..."); listenBtn.setBackground(C_RED); listenBtn.setForeground(Color.WHITE);
-        sttStatusLbl.setText("Speak now, up to ~15 seconds"); sttStatusLbl.setForeground(C_RED);
-        transcriptArea.append("🎤 Listening...\n");
-        if (audio != null) audio.stopListening(); // stop java audio while python uses mic
-        Thread sttThread = new Thread(() -> {
-            String result = runPythonSTT();
+        String engine = whisperOk ? "Whisper AI — speak now" : "Google STT — speak now";
+        sttStatusLbl.setText(engine); sttStatusLbl.setForeground(C_RED);
+        transcriptArea.append("🎤 Listening" + (whisperOk ? " (Whisper AI)" : "") + "...\n");
+        if (audio != null) audio.stopListening();
+        Thread t = new Thread(() -> {
+            String result = runSttQuery();
             SwingUtilities.invokeLater(() -> {
                 processSTTResult(result);
                 if (audio != null) audio.startListening();
@@ -249,25 +320,19 @@ public class DeafMode extends JPanel {
                 sttStatusLbl.setText("Click Listen to transcribe speech"); sttStatusLbl.setForeground(C_SUBTEXT);
             });
         });
-        sttThread.setDaemon(true); sttThread.setName("STTThread"); sttThread.start();
+        t.setDaemon(true); t.setName("STTThread"); t.start();
     }
 
-    // writes + runs the python STT script (googles free api, needs internet)
-    String runPythonSTT() {
-        String script =
-            "import sys\n" +
-            "try:\n    import speech_recognition as sr\n    r = sr.Recognizer()\n    r.pause_threshold = 2.5\n    r.dynamic_energy_threshold = True\n" +
-            "    with sr.Microphone() as source:\n        r.adjust_for_ambient_noise(source, duration=0.5)\n        audio = r.listen(source, timeout=15, phrase_time_limit=30)\n" +
-            "    try:\n        print(r.recognize_google(audio))\n    except sr.UnknownValueError:\n        print('__UNCLEAR__')\n    except sr.RequestError:\n        print('__NO_NET__')\n" +
-            "except ImportError:\n    print('__NO_LIB__')\nexcept Exception as e:\n    print('__ERR__')\n";
+    String runSttQuery() {
+        if (sttProc == null || !sttProc.isAlive()) {
+            startSttProcess(); // try to restart if dead
+            if (sttProc == null) return "__NO_LIB__";
+        }
         try {
-            File scriptFile = new File("/tmp/aa_stt.py");
-            PrintWriter pw = new PrintWriter(new FileWriter(scriptFile)); pw.print(script); pw.close();
-            Process p = Runtime.getRuntime().exec(new String[]{"python3", "/tmp/aa_stt.py"});
-            BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            String line = reader.readLine(); p.waitFor(); reader.close();
+            sttStdin.write("listen\n"); sttStdin.flush();
+            String line = sttStdout.readLine();
             return (line != null) ? line.trim() : "__SILENT__";
-        } catch (Exception glonk) { System.out.println("[STT] error running python: " + glonk.getMessage()); return "__ERR__"; }
+        } catch (Exception e) { System.out.println("[STT] query error: " + e.getMessage()); return "__ERR__"; }
     }
 
     void processSTTResult(String result) {
@@ -376,6 +441,7 @@ public class DeafMode extends JPanel {
     public void cleanup() {
         if (simTimer   != null) simTimer.stop();
         if (flashTimer != null) flashTimer.stop();
+        if (sttProc    != null) sttProc.destroy();
         System.out.println("[DeafMode] cleaned up");
     }
 }
