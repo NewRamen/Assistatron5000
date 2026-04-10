@@ -256,8 +256,8 @@ public class DeafMode extends JPanel {
     String runPythonSTT() {
         String script =
             "import sys\n" +
-            "try:\n    import speech_recognition as sr\n    r = sr.Recognizer()\n    r.pause_threshold = 1.0\n    r.dynamic_energy_threshold = True\n" +
-            "    with sr.Microphone() as source:\n        r.adjust_for_ambient_noise(source, duration=0.5)\n        audio = r.listen(source, timeout=12, phrase_time_limit=15)\n" +
+            "try:\n    import speech_recognition as sr\n    r = sr.Recognizer()\n    r.pause_threshold = 2.5\n    r.dynamic_energy_threshold = True\n" +
+            "    with sr.Microphone() as source:\n        r.adjust_for_ambient_noise(source, duration=0.5)\n        audio = r.listen(source, timeout=15, phrase_time_limit=30)\n" +
             "    try:\n        print(r.recognize_google(audio))\n    except sr.UnknownValueError:\n        print('__UNCLEAR__')\n    except sr.RequestError:\n        print('__NO_NET__')\n" +
             "except ImportError:\n    print('__NO_LIB__')\nexcept Exception as e:\n    print('__ERR__')\n";
         try {

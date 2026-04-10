@@ -36,8 +36,8 @@ public class BlindMode extends JPanel {
     // so a brand new object always announces instantly,
     // but the same object wont spam every scan
     HashMap<String, Long> announceTimes = new HashMap<>();
-    static final int COOLDOWN_NORMAL = 15000; // 15s between same non-danger object
-    static final int COOLDOWN_DANGER = 4000;  // 4s between same danger object
+    static final int COOLDOWN_NORMAL = 8000;  // 8s between same non-danger object
+    static final int COOLDOWN_DANGER = 3000;  // 3s between same danger object
     ArrayList<String>       lastDetected = new ArrayList<>();
     ArrayList<DetectionBox> currentBoxes = new ArrayList<>();
 
@@ -392,21 +392,25 @@ public class BlindMode extends JPanel {
         else if (prox>55) { proximityBar.setForeground(C_ORANGE); proximityBar.setString("Getting close: "+String.format("%.1f",dist)+"m"); proxDescLbl.setText("Caution"); proxDescLbl.setForeground(C_ORANGE); }
         else if (prox>30) { proximityBar.setForeground(C_YELLOW); proximityBar.setString("Moderate: "+String.format("%.1f",dist)+"m"); proxDescLbl.setText("Moderate distance"); proxDescLbl.setForeground(C_YELLOW); }
         else              { proximityBar.setForeground(C_GREEN);  proximityBar.setString("Safe: "+String.format("%.1f",dist)+"m"); proxDescLbl.setText("Safe distance"); proxDescLbl.setForeground(C_GREEN); }
+        // check danger object first — always takes priority
         boolean isDanger = DANGER_SET.contains(near) && dist < 3.0;
         long now = System.currentTimeMillis();
-        long lastTime = announceTimes.getOrDefault(near, 0L);
-        int cooldown = isDanger ? COOLDOWN_DANGER : COOLDOWN_NORMAL;
-        boolean canAnnounce = (now - lastTime) > cooldown;
-        if (isDanger && canAnnounce) {
-            AudioStuff.speakWarning(String.format("%s ahead, %.1f meters!",near,dist));
+        if (isDanger && (now - announceTimes.getOrDefault(near, 0L)) > COOLDOWN_DANGER) {
+            AudioStuff.speakWarning(String.format("%s ahead, %.1f meters!", near, dist));
             alerts.addAlert(new Alert(Alert.AlertType.BLIND_WARNING,"DANGER: "+near+" @ "+String.format("%.1f",dist)+"m",3,near));
             announceTimes.put(near, now);
-        } else if (!isDanger && canAnnounce) {
-            String ann = near+", "+dir+", "+String.format("%.1f",dist)+" meters";
-            if (lastDetected.size()>1) ann += ", also "+lastDetected.get(1);
-            AudioStuff.speak(ann);
-            alerts.addAlert(new Alert(Alert.AlertType.BLIND_OBJECT,near+" @ "+String.format("%.1f",dist)+"m",1,near));
-            announceTimes.put(near, now);
+        } else if (!isDanger) {
+            // find first detected object that isnt on cooldown yet — so a new object always announces
+            // even if the closest one was just spoken
+            for (String obj : lastDetected) {
+                if ((now - announceTimes.getOrDefault(obj, 0L)) > COOLDOWN_NORMAL) {
+                    String ann = obj+", "+dir+", "+String.format("%.1f",dist)+" meters";
+                    AudioStuff.speak(ann);
+                    alerts.addAlert(new Alert(Alert.AlertType.BLIND_OBJECT,obj+" @ "+String.format("%.1f",dist)+"m",1,obj));
+                    announceTimes.put(obj, now);
+                    break; // only announce one per scan so it doesnt talk over itself
+                }
+            }
         }
         totalScans++; scanCountLbl.setText("Scans: "+totalScans);
         logArea.append((isDanger?"🚨 ":"")+(yoloAvail?"[AI]":"[sim]")+" ["+totalScans+"] "+near+" @ "+String.format("%.1f",dist)+"m "+dir+"\n");
